@@ -21,9 +21,9 @@ my $opt_jira;
 GetOptions (
          "user=s"	=> \$opt_user,
          "verbose"  => \$opt_verbose,  
-		 "project=s"=> \$opt_project,
-		 "jira=s"   => \$opt_jira,
-		 "real"     => \$opt_real,
+	 "project=s"=> \$opt_project,
+	 "jira=s"   => \$opt_jira,
+	 "real"     => \$opt_real,
          "help"     => \$opt_help) or pod2usage(-verbose=>1);
 
 $opt_help          && pod2usage(-verbose=>1);
@@ -32,6 +32,7 @@ $opt_help          && pod2usage(-verbose=>1);
 
 my $parser = new MIME::Parser;
 my $tmpdir = tempdir(CLEANUP=>1);
+my $inline = {}; 
 
 $parser->output_under($tmpdir);
 my $entity = $parser->parse(\*STDIN);
@@ -48,17 +49,17 @@ my $data = {
 
 process_entity($entity, $data);
 
-
 if($opt_real) { 
 	$opt_project || pod2usage(-verbose=>1, -msg=>'Missing project key');	
 	$opt_jira    || pod2usage(-verbose=>1, -msg=>'Missing jira url');	
 
 	my $passwd = read_password("JIRA password for $opt_user: "); 
-	my $jira = JIRA::Client::Automated->new($opt_jira, $opt_user, $passwd);
+        my $jira = JIRA::Client::Automated->new($opt_jira, $opt_user, $passwd);
 	my $text = Encode::decode('utf8',$data->{text});
 	if ($data->{format} eq 'html') { 
 		$text = '{html}'.$text.'{html}';
 	}
+
 	my $issue = $jira->create({
             project     => {
                 key => $opt_project,
@@ -69,15 +70,28 @@ if($opt_real) {
             summary     => $data->{subject},
             description => $text,
         });
-warn Data::Dumper::Dumper($issue);
+#warn Data::Dumper::Dumper($issue);
 
 	foreach my $f (@{$data->{files}}) { 
-		$jira->attach_file_to_issue($issue->{key}, $f);
+             my $n=$jira->attach_file_to_issue($issue->{key}, $f);
+             my $url = $n->[0]{content};
+             my $cid=$inline->{$n->[0]{filename}} if exists $inline->{$n->[0]{filename}};
+             next unless $cid;
+             $cid=~s/[<>]//g;  
+             $text=~s/cid:$cid/$url/g;
 	}
+
+        if (keys %$inline) {
+             $jira->update_issue($issue->{key}, {description=>$text});
+        }
+
 
 }
 
-warn Dumper($data);
+
+
+
+#warn Dumper($data);
 
 exit(0);
 
@@ -86,7 +100,7 @@ sub process_entity {
 	my $h = $ent->head;
 	my $ct = $h->mime_type;
 #	warn "Ct: $ct\n";
-	if($ct eq 'multipart/mixed') { 
+	if($ct eq 'multipart/mixed' || $ct eq 'multipart/related' ) { 
 		warn "(\n";	
 		my $n_parts = $ent->parts;
 		for(my $i=0;$i<$n_parts;$i++) { 
@@ -119,12 +133,16 @@ sub process_entity {
 		$data->{format} = $format;
 	} else { 
 		my $disp = $ent->head->mime_attr('content-disposition');
-		if($disp eq 'attachment') { 
-			my $fn   = $ent->head->recommended_filename();
+		if($disp eq 'attachment' || $disp eq 'inline') { 
+                        my $fn   = $ent->head->recommended_filename();                        
 			my $path = $ent->bodyhandle->path;
+                        ($fn) = $path=~/([^\/]+)$/ unless $fn;
+                        if  ($disp eq 'inline') {
+                                my $id = $ent->head->mime_attr('content-id');
+                                $inline->{$fn} = $id;
+                        }         
 			if($path) { 
 				push @{ $data->{files} }, $path;
-				warn "-------- disp: ",$disp," n=$fn p=$path\n"; # . $ent->head->as_string,"\n";
 			} else { 
 				die("No path for ".$ent->head->as_string."\n");
 			}
@@ -135,3 +153,4 @@ sub process_entity {
 
 
 }
+
