@@ -10,15 +10,26 @@ use File::Temp qw(tempdir);
 use JIRA::Client::Automated;
 use MIME::Parser;
 use Encode;
+use Mail::IMAPClient;
+use IO::Socket::SSL;
+
+
 
 use common::sense;
 
-my ( $opt_verbose, $opt_help , $opt_project, $opt_real);
+my ( $opt_verbose, $opt_help , $opt_project, $opt_real, $opt_mailuser, $opt_mailpswd, $opt_mailhost, $opt_no_ssl);
 
 my $opt_user = $ENV{JIRA_USER};
 my $opt_jira;
 
+my $parser = new MIME::Parser;
+
+
 GetOptions (
+         "mailuser=s" => \$opt_mailuser,
+         "mailpswd=s" => \$opt_mailpswd,
+         "mailhost=s" => \$opt_mailhost,
+         "no-ssl"     =>  \$opt_no_ssl,
          "user=s"	=> \$opt_user,
          "verbose"  => \$opt_verbose,  
 	 "project=s"=> \$opt_project,
@@ -28,28 +39,68 @@ GetOptions (
 
 $opt_help          && pod2usage(-verbose=>1);
 
+
+if ($opt_mailuser || $opt_mailpswd || $opt_mailhost ) {
+    pod2usage(-verbose=>1) unless  $opt_mailuser  && $opt_mailhost;
+    my $pass = $opt_mailpswd || read_password("Mail password for $opt_mailuser: ");
+    my $ssl =  ! $opt_no_ssl;
+    if($ssl) {
+        $ssl = new IO::Socket::SSL("${opt_mailhost}:imaps");
+        die ("Error connecting - $@") unless defined $ssl;
+        $ssl->autoflush(1);
+    }
+
+    my $imap = Mail::IMAPClient->new(
+          ($ssl ? ( Socket => $ssl ) : ( Server => $opt_mailhost )),
+           User    => $opt_mailuser,
+           Password=> $pass,
+           ) or die "Cannot connect to $opt_mailhost as $opt_mailuser: $@ ";
+    $imap->select('Inbox')
+        or die "IMAP Select Error: $!";
+
+    my @msgs = $imap->search('ALL')
+        or die "Couldn't get all messages\n";
+
+    foreach my $msgId (@msgs) {
+       # my $envObject = $imap->get_envelope($msgId)       or die "Could not get_envelope: $@\n";
+       # my $su          = decode('MIME-Header', $envObject->{subject});
+       # print Dumper $envObject;
+       # warn "$msgId $su\n";
+        my $data =   $imap->message_string($msgId);
+        #print $data; 
+        process_message($data);
+        exit;
+    }
+
+} else {
+   process_message();
+}
+
+
+sub process_message {
+    my $data = shift; 
+ 
 ## Разбираем письмо из входного потока
 
-my $parser = new MIME::Parser;
-my $tmpdir = tempdir(CLEANUP=>1);
-my $inline = {}; 
+    my $tmpdir = tempdir(CLEANUP=>1);
+    my $inline = {}; 
 
-$parser->output_under($tmpdir);
-my $entity = $parser->parse(\*STDIN);
+    $parser->output_under($tmpdir);
+    my $entity = $data ? $parser->parse_data($data) : $parser->parse(\*STDIN);
 
 
 
 ### Congratulations: you now have a (possibly multipart) MIME entity!
-$entity->dump_skeleton;          # for debugging
+    $entity->dump_skeleton;          # for debugging
 
-my $data = { 
+    my $data = { 
 	subject => Encode::decode('MIME-Header', $entity->head->get('subject')),
 	files   => [],
-};
+    };
 
-process_entity($entity, $data);
+    process_entity($entity, $data,$inline);
 
-if($opt_real) { 
+    if($opt_real) { 
 	$opt_project || pod2usage(-verbose=>1, -msg=>'Missing project key');	
 	$opt_jira    || pod2usage(-verbose=>1, -msg=>'Missing jira url');	
 
@@ -86,9 +137,10 @@ if($opt_real) {
         }
 
 
+    }
+
+
 }
-
-
 
 
 #warn Dumper($data);
@@ -96,7 +148,7 @@ if($opt_real) {
 exit(0);
 
 sub process_entity { 
-	my ($ent, $data) = @_;
+	my ($ent, $data,$inline) = @_;
 	my $h = $ent->head;
 	my $ct = $h->mime_type;
 #	warn "Ct: $ct\n";
@@ -119,7 +171,7 @@ sub process_entity {
 # For JIRA, ignore HTML :(
 				$best_part = $part;
 			} else { 
-				die("Unexpected mime type $mime_type in alternative ", $entity->dump_skeleton);
+				die("Unexpected mime type $mime_type in alternative ", $ent->dump_skeleton);
 			}
 		}
 		warn "[\n";
